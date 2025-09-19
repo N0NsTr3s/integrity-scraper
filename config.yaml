@@ -1,0 +1,7 @@
+# Website Integrity Monitor Configuration
+
+# Scanning settings
+default_depth: 3
+headless: true
+wait_time: 10
+
