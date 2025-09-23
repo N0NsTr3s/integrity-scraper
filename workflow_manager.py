@@ -6,20 +6,20 @@ Handles the entire workflow of scanning, analyzing, and reporting
 import os
 import json
 import time
-import hashlib
+
 import yaml
 from datetime import datetime
-from pathlib import Path
 from urllib.parse import urlparse
 
 from enhanced_monitor_demo import EnhancedNetworkMonitor
 from analyze_pci_compliance import analyze_captured_data
-from file_change_detector import detect_changes, get_file_hash
+from file_change_detector import detect_changes
+from utils import load_config, get_reports_directory_from_domain
 
 class IntegrityWorkflow:
     """Workflow manager for website integrity monitoring"""
     
-    def __init__(self, url, config=None, logger=None):
+    def __init__(self, url, config=None, config_path="./config.yaml", logger=None):
         """Initialize the workflow manager
         
         Args:
@@ -28,7 +28,12 @@ class IntegrityWorkflow:
             logger (logging.Logger, optional): Logger instance
         """
         self.url = url
-        self.config = config or self._load_config()
+        # Prefer an explicit config dict, else load from provided config_path, else fallback to standard config.yaml
+        if config is not None:
+            self.config = config
+        else:
+            cfg_path = config_path if config_path else os.path.join(os.path.dirname(__file__), 'config.yaml')
+            self.config = load_config(cfg_path)
         self.logger = logger
         
         # Extract domain for reference (monitor will handle actual directory creation)
@@ -47,29 +52,9 @@ class IntegrityWorkflow:
         # If we have a monitor instance, use its reports directory
         if hasattr(self, 'monitor') and self.monitor:
             return self.monitor.get_reports_directory()
-            
-        # Fallback: try to determine the versioned directory from domain
-        # This should match whatever main directory structure was created
-        base_dir = f'./{self.domain}'
-        
-        if os.path.exists(base_dir):
-            # Use base directory name for reports
-            reports_dir = os.path.join("./reports", self.domain)
-        else:
-            # Find the versioned directory that exists
-            counter = 1
-            while os.path.exists(f"{base_dir}_{counter}"):
-                counter += 1
-            
-            # Use the last existing version for reports consistency
-            if counter > 1:
-                versioned_domain = f"{self.domain}_{counter-1}"
-                reports_dir = os.path.join("./reports", versioned_domain)
-            else:
-                reports_dir = os.path.join("./reports", self.domain)
-        
-        os.makedirs(reports_dir, exist_ok=True)
-        return reports_dir
+        # Fallback: create/get a reports directory matching the domain or monitor output
+        output_dir = getattr(self, 'output_dir', None)
+        return get_reports_directory_from_domain(self.domain, output_dir)
         
     def _load_config(self):
         """Load configuration from config.yaml file"""
@@ -137,7 +122,8 @@ class IntegrityWorkflow:
             self._log(f"Scanning with depth {depth}")
             
             # First monitor call will set up the directory structure
-            results = self.monitor.monitor_url(self.url, wait_after_load=5, max_depth=depth)
+            # Use configured wait_time for post-load sleeping when available
+            results = self.monitor.monitor_url(self.url, wait_after_load=self.config.get('wait_time', 5), max_depth=depth)
             
             # Now get the output directory from the monitor
             self.output_dir = self.monitor.output_directory
@@ -164,7 +150,7 @@ class IntegrityWorkflow:
             
         finally:
             # Cleanup
-            self.monitor.close()
+            self.monitor.driver.close() # type: ignore
     
     def _find_previous_scan(self):
         """Find the most recent scan file"""

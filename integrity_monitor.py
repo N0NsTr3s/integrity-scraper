@@ -11,34 +11,7 @@ from datetime import datetime
 import traceback
 from analyze_pci_compliance import analyze_captured_data
 from file_change_detector import detect_changes
-
-def load_config():
-    """Load configuration from config.yaml file"""
-    config_file = os.path.join(os.path.dirname(__file__), "config.yaml")
-    
-    DEFAULT_CONFIG = {
-        "output_dir": "scan_results",
-        "default_depth": 2,
-        "headless": True,
-        "wait_time": 10,
-        "excluded_domains": [
-            "github.com",
-            "fonts.googleapis.com",
-            "cdn.",
-            "docs."
-        ]
-    }
-    
-    if os.path.exists(config_file):
-        with open(config_file, "r") as f:
-            try:
-                user_config = yaml.safe_load(f)
-                if user_config:
-                    return {**DEFAULT_CONFIG, **user_config}
-            except Exception as e:
-                print(f"Error loading config file: {e}")
-    
-    return DEFAULT_CONFIG
+from utils import load_config
 
 def setup_logger(name):
     """Set up logging for the application"""

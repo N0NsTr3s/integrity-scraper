@@ -7,9 +7,11 @@ import sys
 import os
 import hashlib
 from datetime import datetime
+import argparse
 from pci_dss_monitor import PCIDSSComplianceMonitor
 # Import get_file_hash from file_change_detector
 from file_change_detector import get_file_hash
+from utils import save_current_file_hashes, load_previous_file_hashes
 
 def find_first_scan_hashes(domain, reports_directory=None, output_directory=None):
     """Find the file_hashes.json from the first scan for this domain
@@ -226,7 +228,7 @@ def analyze_line_changes_with_ranges(added_lines, deleted_lines, original_file, 
             'ranges': {'added_ranges': [], 'deleted_ranges': [], 'modified_ranges': []}
         }
 
-def perform_detailed_change_analysis(changed_files, output_directory, reports_directory):
+def perform_detailed_change_analysis(changed_files, output_directory, reports_directory, baseline_hashes=None):
     """Perform detailed line-by-line analysis of changed files
     
     Args:
@@ -253,7 +255,7 @@ def perform_detailed_change_analysis(changed_files, output_directory, reports_di
         if not current_filepath or not os.path.exists(current_filepath):
             continue
             
-        # Try to find the original file in the base domain directory
+    # Try to find the original file in the base domain directory
         domain = file_info.get('domain', '')
         base_domain = domain.split('_')[0] if '_' in domain else domain
         
@@ -275,6 +277,38 @@ def perform_detailed_change_analysis(changed_files, output_directory, reports_di
                 for root, dirs, files in os.walk(base_domain_dir):
                     if current_filename in files:
                         original_filepath = os.path.join(root, current_filename)
+                        break
+
+            # If not found and baseline_hashes provided, check baseline mapping for filepath
+            if (not original_filepath or not os.path.exists(original_filepath)) and baseline_hashes:
+                try:
+                    prev_entry = baseline_hashes.get(url)
+                    if prev_entry:
+                        prev_path = prev_entry.get('filepath')
+                        if prev_path and os.path.exists(prev_path):
+                            original_filepath = prev_path
+                except Exception:
+                    pass
+
+            # If still not found, attempt a broader search in provided directories for same filename
+            if (not original_filepath or not os.path.exists(original_filepath)):
+                search_paths = []
+                if output_directory and os.path.exists(output_directory):
+                    search_paths.append(output_directory)
+                if reports_directory and os.path.exists(reports_directory):
+                    search_paths.append(reports_directory)
+                # Also search current working directory as a last resort
+                search_paths.append('.')
+
+                for search_root in search_paths:
+                    for root, dirs, files in os.walk(search_root):
+                        if current_filename in files:
+                            candidate = os.path.join(root, current_filename)
+                            # Prefer candidate with same domain directory in path if possible
+                            if base_domain in candidate or domain in candidate or search_root == output_directory:
+                                original_filepath = candidate
+                                break
+                    if original_filepath:
                         break
         
         if original_filepath and os.path.exists(original_filepath):
@@ -335,43 +369,8 @@ def perform_detailed_change_analysis(changed_files, output_directory, reports_di
             print(f"   ⚠️ Could not find original file for comparison: {url}")
     
     return detailed_changes
-    """Load previously stored file hashes for comparison"""
-    hash_file = os.path.join(hash_directory, "file_hashes.json")
-    if os.path.exists(hash_file):
-        try:
-            with open(hash_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Warning: Could not load previous hashes: {e}")
-    return {}
-
-def load_previous_file_hashes(hash_directory="."):
-    """Load previously saved file hashes from JSON file
     
-    Args:
-        hash_directory (str): Directory containing file_hashes.json
-        
-    Returns:
-        dict: Previously saved hashes, empty dict if not found
-    """
-    hash_file = os.path.join(hash_directory, "file_hashes.json")
-    if os.path.exists(hash_file):
-        try:
-            with open(hash_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Warning: Could not load previous hashes: {e}")
-    return {}
-
-def save_current_file_hashes(current_hashes, hash_directory="."):
-    """Save current file hashes for future comparison"""
-    hash_file = os.path.join(hash_directory, "file_hashes.json")
-    try:
-        with open(hash_file, 'w', encoding='utf-8') as f:
-            json.dump(current_hashes, f, indent=2)
-        print(f"📊 File hashes saved to {hash_file}")
-    except Exception as e:
-        print(f"Warning: Could not save current hashes: {e}")
+# Using save_current_file_hashes and load_previous_file_hashes from utils
 
 def analyze_file_changes(current_files, previous_hashes):
     """Analyze file changes between current and previous captures"""
@@ -477,7 +476,7 @@ def analyze_file_changes(current_files, previous_hashes):
     
     return changes, current_hashes
 
-def analyze_captured_data(json_file_path, return_results=False, output_directory=None, reports_directory=None):
+def analyze_captured_data(json_file_path, return_results=False, output_directory=None, reports_directory=None, config_path=None):
     """Analyze the captured data for PCI DSS compliance
     
     Args:
@@ -511,8 +510,16 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
     
     monitor = PCIDSSComplianceMonitor()
     
-    # Extract primary domain from the first captured request
-    primary_domain = "stripe-payments-demo.appspot.com"  # Based on your data
+    # Determine primary domain from provided directories or captured requests
+    # Prefer explicit reports/output directory names when available, else infer
+    domain = ""
+    if reports_directory:
+        domain = os.path.basename(reports_directory)
+    elif output_directory:
+        domain = os.path.basename(output_directory)
+
+    # Use base domain without version suffix if present
+    primary_domain = domain.split('_')[0] if domain else None
     
     print("🔒 PCI DSS v4.0 COMPLIANCE ANALYSIS")
     print("=" * 60)
@@ -526,12 +533,13 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
         responses = first_capture.get('responses', {})
         print(f"📊 Analyzing {len(requests)} requests and {len(responses)} responses...")
         
-        # Extract JavaScript files and all domains
+        # Extract JavaScript files and all domains (with counts)
         js_files = []
+        domain_counts = {}
         all_domains = set()
         css_files = []
         all_files = []
-        
+
         # Process requests
         for request_id, request in requests.items():
             url = request.get('url', '')
@@ -540,6 +548,7 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
             from urllib.parse import urlparse
             domain = urlparse(url).netloc
             all_domains.add(domain)
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
             
             # Get corresponding response
             response = responses.get(request_id, {})
@@ -600,6 +609,13 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
         print(f"�🌐 Across {len(all_domains)} domains")
         
         # Show discovered domains
+        # If primary_domain was not determined from directories, pick the most common domain
+        if not primary_domain:
+            if domain_counts:
+                primary_domain = max(domain_counts.items(), key=lambda kv: kv[1])[0]
+            else:
+                primary_domain = ''
+
         print(f"\n🌍 DISCOVERED DOMAINS:")
         print("-" * 40)
         for domain in sorted(all_domains):
@@ -610,18 +626,47 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
         print(f"\n📊 FILE CHANGE ANALYSIS:")
         print("-" * 40)
         
-        # Get domain from the reports_directory or output_directory
-        domain = ""
-        if reports_directory:
-            domain = os.path.basename(reports_directory)
-        elif output_directory:
-            domain = os.path.basename(output_directory)
-        
+        # Get domain name to use when searching for baseline file hashes
+        # Use the computed primary_domain (most-common domain) rather than the
+        # loop-scoped `domain` variable which contains the last-request domain
+        # and can cause the baseline lookup to miss the true site baseline.
+        domain_for_baseline = primary_domain or (os.path.basename(reports_directory) if reports_directory else (os.path.basename(output_directory) if output_directory else ''))
+
+        # Load config and apply ignore patterns before analysis
+        from utils import load_config, matches_ignore_patterns
+        cfg_path = config_path if config_path else 'config.yaml'
+        config = load_config(cfg_path)
+        ignore_patterns = config.get('ignore_patterns', [])
+
+        # Filter files by ignore patterns (match URL and filepath)
+        filtered_files = []
+        for f in all_files:
+            url = f.get('url', '')
+            filepath = f.get('filepath') or ''
+            if matches_ignore_patterns(url, ignore_patterns) or (filepath and matches_ignore_patterns(filepath, ignore_patterns)):
+                print(f"   ⤷ Ignoring {url} due to ignore_patterns")
+                continue
+            filtered_files.append(f)
+
         # Try to load baseline hashes from first scan
-        baseline_hashes = find_first_scan_hashes(domain, reports_directory, output_directory)
-        
-        # Analyze changes using current file analysis
-        file_changes, current_hashes = analyze_file_changes(all_files, baseline_hashes)
+        baseline_hashes = find_first_scan_hashes(domain_for_baseline, reports_directory, output_directory)
+
+        # Filter baseline hashes based on ignore_patterns so ignored URLs are not reported as deleted
+        try:
+            filtered_baseline = {}
+            for b_url, b_info in (baseline_hashes or {}).items():
+                fp = b_info.get('filepath', '') if isinstance(b_info, dict) else ''
+                if matches_ignore_patterns(b_url, ignore_patterns) or (fp and matches_ignore_patterns(fp, ignore_patterns)):
+                    # skip baseline entry since it's intentionally ignored
+                    continue
+                filtered_baseline[b_url] = b_info
+            baseline_hashes = filtered_baseline
+        except Exception:
+            # If anything goes wrong, fall back to unfiltered baseline_hashes
+            pass
+
+        # Analyze changes using current file analysis (after filtering)
+        file_changes, current_hashes = analyze_file_changes(filtered_files, baseline_hashes)
         
         # Display file change results
         if file_changes['new_files']:
@@ -659,7 +704,7 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
                 print(f"\n🔍 DETAILED CHANGE ANALYSIS:")
                 print("-" * 40)
                 detailed_analysis = perform_detailed_change_analysis(
-                    non_image_changes, output_directory, reports_directory
+                    non_image_changes, output_directory, reports_directory, baseline_hashes
                 )
                 
                 if detailed_analysis['files_analyzed'] > 0:
@@ -808,6 +853,10 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
             for alert in security_alerts[:3]:  # Show first 3
                 print(f"   ⚠️ {alert}")
         
+        # Ensure primary_domain is a string for downstream APIs
+        if primary_domain is None:
+            primary_domain = ''
+
         # Categorize scripts
         script_categories = monitor.categorize_scripts({'captured_elements': js_files}, primary_domain)
         
@@ -826,37 +875,108 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
         for script in script_categories['fourth_party'][:3]:  # Show first 3
             print(f"   🚨 {script['url']} (Risk: {script['risk']})")
         
-        # Check CSP compliance - look in response headers
+        # Check CSP compliance - look in response headers and record locations
         csp_analysis = {'csp_found': False, 'violations': [], 'policy': ''}
-        
+
+        # We'll inspect both 'content-security-policy' and 'content-security-policy-report-only'
         for request_id, response in responses.items():
             response_headers = response.get('headers', {})
-            csp = response_headers.get('content-security-policy')
-            
-            if csp:
+            # Normalize header keys to lower-case keys if necessary
+            # (headers may already be lower-cased in the capture)
+            csp_header = None
+            header_name = None
+            for hname, hval in response_headers.items():
+                if hname.lower() == 'content-security-policy':
+                    csp_header = hval
+                    header_name = 'content-security-policy'
+                    break
+                if hname.lower() == 'content-security-policy-report-only' and csp_header is None:
+                    csp_header = hval
+                    header_name = 'content-security-policy-report-only'
+
+            if csp_header:
                 csp_analysis['csp_found'] = True
-                csp_analysis['policy'] = csp
-                
-                # Check for common CSP issues
-                if "'unsafe-inline'" in csp:
-                    csp_analysis['violations'].append("Unsafe inline scripts allowed")
-                if "'unsafe-eval'" in csp:
-                    csp_analysis['violations'].append("Unsafe eval allowed")
-                if "*" in csp and "script-src" in csp:
-                    csp_analysis['violations'].append("Wildcard script sources allowed")
-                break
-                
+                csp_analysis['policy'] = csp_header
+
+                # Determine the URL associated with this response (if a matching request exists)
+                req_url = ''
+                try:
+                    req_entry = requests.get(request_id)
+                    if isinstance(req_entry, dict):
+                        req_url = req_entry.get('url', '')
+                except Exception:
+                    req_url = ''
+
+                # Skip CSP analysis for ignored URLs (config-driven)
+                try:
+                    from utils import load_config, matches_ignore_patterns
+                    # Use cfg_path determined earlier so --config is honored; fall back to 'config.yaml'
+                    cfg = load_config(cfg_path if 'cfg_path' in locals() else (config_path if config_path else 'config.yaml'))
+                    ignore_patterns = cfg.get('ignore_patterns', [])
+                    # If the request URL or the response URL matches ignore patterns, skip
+                    if (req_url and matches_ignore_patterns(req_url, ignore_patterns)) or (matches_ignore_patterns(response.get('url', ''), ignore_patterns)):
+                        # don't record this CSP header as a violation location
+                        continue
+                except Exception:
+                    # If config load fails, proceed with analysis
+                    pass
+
+                # Check for common CSP issues and record where they were found
+                if "'unsafe-inline'" in csp_header:
+                    csp_analysis['violations'].append({
+                        'issue': 'Unsafe inline scripts allowed',
+                        'request_id': request_id,
+                        'url': req_url,
+                        'header': header_name,
+                        'policy_snippet': "'unsafe-inline'"
+                    })
+                if "'unsafe-eval'" in csp_header:
+                    csp_analysis['violations'].append({
+                        'issue': 'Unsafe eval allowed',
+                        'request_id': request_id,
+                        'url': req_url,
+                        'header': header_name,
+                        'policy_snippet': "'unsafe-eval'"
+                    })
+                # Detect wildcard in script-src (e.g., script-src * or script-src 'self' * )
+                if 'script-src' in csp_header and '*' in csp_header:
+                    csp_analysis['violations'].append({
+                        'issue': 'Wildcard script sources allowed',
+                        'request_id': request_id,
+                        'url': req_url,
+                        'header': header_name,
+                        'policy_snippet': 'script-src with *'
+                    })
+
+                # Continue scanning all responses to collect all violations (don't break)
+
         if not csp_analysis['csp_found']:
-            csp_analysis['violations'].append("No Content Security Policy found")
-        
+            csp_analysis['violations'].append({
+                'issue': 'No Content Security Policy found',
+                'request_id': None,
+                'url': None,
+                'header': None,
+                'policy_snippet': ''
+            })
+
         print(f"\n🛡️ CONTENT SECURITY POLICY ANALYSIS:")
         print("-" * 40)
         print(f"CSP Found: {'✅ Yes' if csp_analysis['csp_found'] else '❌ No'}")
-        
+
         if csp_analysis['violations']:
             print("🚨 CSP Violations:")
             for violation in csp_analysis['violations']:
-                print(f"   - {violation}")
+                if isinstance(violation, dict):
+                    loc = f"(header={violation.get('header')}"
+                    if violation.get('request_id'):
+                        loc += f", request_id={violation.get('request_id')}"
+                    if violation.get('url'):
+                        loc += f", url={violation.get('url')}"
+                    loc += ")"
+                    print(f"   - {violation.get('issue')}: {violation.get('policy_snippet')} {loc}")
+                else:
+                    # Fallback to string message
+                    print(f"   - {violation}")
         else:
             print("✅ No CSP violations detected")
         
@@ -1007,9 +1127,12 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
             return analysis_results
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python analyze_pci_compliance.py <json_file>")
-        print("Example: python analyze_pci_compliance.py recursive_enhanced_capture_20250917_215131.json")
-        sys.exit(1)
-    
-    analyze_captured_data(sys.argv[1])
+    parser = argparse.ArgumentParser(description='Analyze captured PCI compliance JSON')
+    parser.add_argument('json_file', help='Path to captured JSON file')
+    parser.add_argument('--config', '-c', dest='config', help='Path to config.yaml', default=None)
+    parser.add_argument('--output-dir', dest='output_dir', help='Output directory for current scan (optional)', default=None)
+    parser.add_argument('--reports-dir', dest='reports_dir', help='Reports directory to save file_hashes.json (optional)', default=None)
+
+    args = parser.parse_args()
+
+    analyze_captured_data(args.json_file, output_directory=args.output_dir, reports_directory=args.reports_dir, config_path=args.config)

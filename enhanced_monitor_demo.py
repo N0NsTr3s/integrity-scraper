@@ -16,6 +16,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from utils import get_versioned_directory, is_image_url
 
 class EnhancedNetworkMonitor:
     def __init__(self, driver_path=None, headless=True, wait_time=10, output_directory='./output', excluded_domains=None, excluded_paths=None):
@@ -112,29 +113,13 @@ class EnhancedNetworkMonitor:
         if self.main_domain is None:
             # First time - set the main domain based on the initial URL
             self.main_domain = domain
-            self.output_directory = self._get_versioned_directory(domain)
+            self.output_directory = get_versioned_directory(domain)
             print(f"📁 Created main output directory: {self.output_directory}")
         
         # Always return the full path including the subdomain folder
         return self.output_directory
     
-    def _get_versioned_directory(self, domain):
-        """Create a versioned directory for the domain if it already exists"""
-        base_dir = f'./{domain}'
-        
-        # Check if directory exists and find next available version
-        if not os.path.exists(base_dir):
-            os.makedirs(base_dir, exist_ok=True)
-            return base_dir
-        
-        # Directory exists, find next version number
-        version = 1
-        while True:
-            versioned_dir = f'./{domain}_{version}'
-            if not os.path.exists(versioned_dir):
-                os.makedirs(versioned_dir, exist_ok=True)
-                return versioned_dir
-            version += 1
+    # _get_versioned_directory removed; using utils.get_versioned_directory instead
     
     def get_domain_output_directory(self, url_domain):
         """Get the output directory for a specific domain"""
@@ -145,20 +130,6 @@ class EnhancedNetworkMonitor:
         domain_dir = os.path.join(self.output_directory, url_domain)
         os.makedirs(domain_dir, exist_ok=True)
         return domain_dir
-    
-    def get_reports_directory(self):
-        """Get the reports directory for the main domain with versioning to match output directory"""
-        if self.main_domain is None:
-            raise ValueError("Main domain not set. Call set_output_directory first.")
-        
-        # Extract the versioned directory name from output_directory 
-        # output_directory could be "./domain" or "./domain_1" etc.
-        output_dir_name = os.path.basename(self.output_directory)
-        
-        # Create matching reports directory structure: ./reports/{same_versioned_name}/
-        reports_dir = os.path.join("./reports", output_dir_name)
-        os.makedirs(reports_dir, exist_ok=True)
-        return reports_dir
     
     def setup_driver(self):
         """Setup Chrome driver with CDP logging enabled"""
@@ -601,7 +572,7 @@ class EnhancedNetworkMonitor:
         except Exception as e:
             print(f"Error collecting performance resources: {e}")
     
-    def monitor_url(self, url, scroll_behavior='end', wait_after_load=5, max_depth=2):
+    def monitor_url(self, url, scroll_behavior='end', wait_after_load=None, max_depth=3):
         """Monitor a URL and capture all network activity"""
         print(f"🌐 Starting enhanced network monitoring for: {url} (max_depth={max_depth})")
         
@@ -640,27 +611,33 @@ class EnhancedNetworkMonitor:
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
             
-            # Collect initial network logs
-            time.sleep(2)
+            # Collect initial network logs (short pause)
+            time.sleep(min(5, self.wait_time))
             self.collect_network_logs()
             
             # Scroll behavior
             if scroll_behavior == 'end':
                 self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);") # type: ignore
-                time.sleep(2)
+                time.sleep(min(2, self.wait_time))
                 self.collect_network_logs()
             elif scroll_behavior == 'all':
                 self.scroll_page_gradually()
             
-            # Wait for additional network activity
-            print(f"⏱️ Waiting {wait_after_load} seconds for additional network activity...")
-            time.sleep(wait_after_load)
+            # Determine effective wait_after_load (use configured self.wait_time when None)
+            effective_wait = wait_after_load if wait_after_load is not None else self.wait_time
+            print(f"⏱️ Waiting {effective_wait} seconds for additional network activity...")
+            time.sleep(effective_wait)
             
             # Final collection of network logs
             self.collect_network_logs()
             
             # Collect page sources - this will populate self.sources['collected_elements']
             dom_elements = self.collect_page_sources()
+            
+            # Capture additional elements with SRI attributes from the main page
+            domain = urlparse(url).netloc
+            output_dir = self.get_domain_output_directory(domain)
+            self.capture_additional_elements(url, output_dir)
             
             # Add the URL to unique URLs set
             self.unique_urls.add(url)
@@ -864,6 +841,10 @@ class EnhancedNetworkMonitor:
                 self.driver.get(url) # type: ignore
                 time.sleep(2)
                 self.collect_network_logs()
+                
+                # Capture additional elements with SRI attributes
+                self.capture_additional_elements(url, output_dir)
+                
                 # Pass current_depth directly since extract_and_process_unique_urls will increment it when calling process_individual_url
                 self.extract_and_process_unique_urls(url, current_depth, max_depth)
                 
@@ -873,7 +854,25 @@ class EnhancedNetworkMonitor:
     def is_webpage(self, url):
         """Check if the URL is likely a webpage based on its extension"""
         webpage_extensions = ['.html', '.htm', '.php', '.asp', '.jsp']
-        return any(url.endswith(ext) for ext in webpage_extensions) or '://' in url
+ 
+
+
+
+    def get_reports_directory(self):
+        """Get the reports directory for the main domain with versioning to match output directory"""
+        if self.main_domain is None:
+            raise ValueError("Main domain not set. Call set_output_directory first.")
+        
+        # Extract the versioned directory name from output_directory 
+        # output_directory could be "./domain" or "./domain_1" etc.
+        output_dir_name = os.path.basename(self.output_directory)
+        
+        # Create matching reports directory structure: ./reports/{same_versioned_name}/
+        reports_dir = os.path.join("./reports", output_dir_name)
+        os.makedirs(reports_dir, exist_ok=True)
+        return reports_dir
+
+    # is_webpage implemented later in the class
     
     def collect_individual_network_logs(self, current_url):
         """Collect network logs specifically for the current navigation"""
@@ -1045,7 +1044,12 @@ class EnhancedNetworkMonitor:
                     additional_sources[f"additional_script_{i}"] = {
                         'url': src,
                         'type': 'script',
-                        'discovered_on': current_url
+                        'discovered_on': current_url,
+                        'integrity': script.get_attribute("integrity"),
+                        'crossorigin': script.get_attribute("crossorigin"),
+                        'nonce': script.get_attribute("nonce"),
+                        'async': script.get_attribute("async"),
+                        'defer': script.get_attribute("defer")
                     }
             
             # Links
@@ -1058,7 +1062,11 @@ class EnhancedNetworkMonitor:
                         'url': href,
                         'type': 'link',
                         'rel': link.get_attribute("rel"),
-                        'discovered_on': current_url
+                        'discovered_on': current_url,
+                        'integrity': link.get_attribute("integrity"),
+                        'crossorigin': link.get_attribute("crossorigin"),
+                        'media': link.get_attribute("media"),
+                        'as': link.get_attribute("as")
                     }
             
             if additional_sources:
@@ -1182,8 +1190,7 @@ class EnhancedNetworkMonitor:
    
 
     def is_image_url(self, url):
-        url_base = url.split('?', 1)[0].split('#', 1)[0]
-        return bool(re.search(r'/[^/]+\.(jpg|jpeg|png|gif|bmp|webp|svg|ico)$', url_base, re.IGNORECASE))
+        return is_image_url(url)
     
     def log_file_changes(self, previous_files):
         """Log changes in files compared to a previous state"""

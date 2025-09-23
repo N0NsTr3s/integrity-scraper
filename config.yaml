@@ -5,3 +5,17 @@ default_depth: 3
 headless: true
 wait_time: 10
 
+# Wildcard patterns (fnmatch) to ignore files in change detection
+# Use Unix shell-style wildcards. Examples:
+# - '*/favicon.ico' to ignore any favicon
+# - '*/tagmanager/*' to ignore tagmanager script URLs
+ignore_patterns:
+  - '*/favicon.ico'
+  - '*/tagmanager/*'
+  - '*www.paypalobjects.com/api/checkout.min.js'
+  - 'https://www.sandbox.paypal.com/smart/button?env=sandbox&style.label=checkout&funding.disallowed=*'
+  - 'https://www.sandbox.paypal.com/smart/button?env=sandbox&style.label=credit&funding.disallowed=*'
+  - 'https://payments.sandbox.braintree-api.com/graphql'
+  - 'https://pay.google.com/gp/p/ui/payframe?origin=https%3A%2F%2Fbraintree.github.io&mid='
+  - 'https://www.paypal.com/xoplatform/logger/api/logger'
+  - 'https://pay.google.com/gp/p/js/pay.js'
