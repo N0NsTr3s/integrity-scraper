@@ -31,8 +31,8 @@ def main():
         print(f"  {i}. {p}")
 
     scan = load_scan(scan_file)
-    requests = scan.get('requests', {})
-    captured_files = scan.get('captured_files', {})
+    requests = scan.get('requests', {}) # type: ignore
+    captured_files = scan.get('captured_files', {}) # type: ignore
 
     print('\nChecking requests:')
     missing = []

@@ -6,6 +6,7 @@ import json
 import sys
 import os
 import hashlib
+import asyncio
 from datetime import datetime
 import argparse
 from pci_dss_monitor import PCIDSSComplianceMonitor
@@ -222,7 +223,7 @@ def analyze_line_changes_with_ranges(added_lines, deleted_lines, original_file, 
     except Exception as e:
         print(f"   ❌ Error analyzing line ranges: {e}")
         return {
-            'additions': [],
+            'additions': [], 
             'deletions': [], 
             'modifications': [],
             'ranges': {'added_ranges': [], 'deleted_ranges': [], 'modified_ranges': []}
@@ -255,7 +256,7 @@ def perform_detailed_change_analysis(changed_files, output_directory, reports_di
         if not current_filepath or not os.path.exists(current_filepath):
             continue
             
-    # Try to find the original file in the base domain directory
+        # Try to find the original file in the base domain directory
         domain = file_info.get('domain', '')
         base_domain = domain.split('_')[0] if '_' in domain else domain
         
@@ -267,7 +268,7 @@ def perform_detailed_change_analysis(changed_files, output_directory, reports_di
         base_domain_dir = f"./{base_domain}"
         if os.path.exists(base_domain_dir):
             # Try to find the file with the same relative path structure
-            relative_path = os.path.relpath(current_filepath, output_directory)
+            relative_path = os.path.relpath(current_filepath, output_directory) if output_directory else os.path.relpath(current_filepath, base_domain_dir)
             potential_original = os.path.join(base_domain_dir, relative_path)
             
             if os.path.exists(potential_original):
@@ -497,7 +498,7 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
         'analysis_timestamp': datetime.now().isoformat(),
         'file_changes': {}
     }
-    
+
     try:
         with open(json_file_path, 'r', encoding='utf-8') as f:
             captured_data = json.load(f)
@@ -506,10 +507,103 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
         if return_results:
             analysis_results['error'] = str(e)
             return analysis_results
-        return
-    
+        return None
+
+    # If the input is the compact format (produced by tools/compact_scan.py)
+    def _normalize_compact_scan_local(compact_list):
+        normalized = []
+        for item in compact_list:
+            # If this item already looks like a full scan, keep as-is
+            if isinstance(item, dict) and ('requests' in item or 'linked_resources' in item):
+                normalized.append(item)
+                continue
+
+            grouped = item.get('grouped', {}) if isinstance(item, dict) else {}
+            request_map = item.get('request_map', {}) if isinstance(item, dict) else {}
+
+            requests = {}
+            responses = {}
+            bodies = {}
+            extra_info = {}
+            failed_requests = {}
+            captured_files = {}
+            sources = {}
+            linked_resources = {}
+
+            # Reconstruct sources and captured_files where possible
+            for rid, entry in grouped.items():
+                req = entry.get('request') or {}
+                resp = entry.get('response') or {}
+                body = entry.get('body') or {}
+
+                requests[rid] = req
+                responses[rid] = resp
+                bodies[rid] = body
+
+                # extra_info may already be a dict with request/response
+                ei = entry.get('extra_info') or {}
+                if isinstance(ei, dict):
+                    extra_info[f"{rid}_request"] = ei.get('request', {})
+                    extra_info[f"{rid}_response"] = ei.get('response', {})
+
+                if entry.get('failed'):
+                    failed_requests[rid] = entry.get('failure_info', {}) or {}
+
+                # captured_file stored keyed by URL in the original full scan
+                cf = entry.get('captured_file')
+                if cf is not None:
+                    # prefer mapping by request URL if available, else by request id
+                    url = (req or {}).get('url') or (resp or {}).get('url') or request_map.get(rid)
+                    if url:
+                        captured_files[url] = cf
+                    else:
+                        captured_files[rid] = cf
+
+                # sources: compact format stores list of {id, source}
+                srcs = entry.get('sources') or []
+                for s in srcs:
+                    sid = s.get('id')
+                    src = s.get('source')
+                    if sid and src is not None:
+                        sources[sid] = src
+
+                # linked_resources: keep grouped entries as linked when possible
+                # Use request id as key and include request/response/body as stored
+                linked_resources[rid] = {
+                    'request': req,
+                    'response': resp,
+                    'body': body,
+                    'extra_info': ei,
+                    'failed': bool(entry.get('failed')),
+                    'failure_info': entry.get('failure_info', {}),
+                    'captured_at': entry.get('captured_at')
+                }
+
+            capture_info = item.get('capture_info', {}) or {}
+
+            normalized.append({
+                'capture_info': capture_info,
+                'requests': requests,
+                'responses': responses,
+                'bodies': bodies,
+                'extra_info': extra_info,
+                'failed_requests': failed_requests,
+                'captured_files': captured_files,
+                'sources': sources,
+                'linked_resources': linked_resources
+            })
+
+        return normalized
+
+    # Normalize compact format if needed
+    if isinstance(captured_data, list) and len(captured_data) > 0 and isinstance(captured_data[0], dict) and ('grouped' in captured_data[0] or 'request_map' in captured_data[0]):
+        try:
+            captured_data = _normalize_compact_scan_local(captured_data)
+        except Exception:
+            pass
+
     monitor = PCIDSSComplianceMonitor()
-    
+
     # Determine primary domain from provided directories or captured requests
     # Prefer explicit reports/output directory names when available, else infer
     domain = ""
@@ -520,10 +614,10 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
 
     # Use base domain without version suffix if present
     primary_domain = domain.split('_')[0] if domain else None
-    
+
     print("🔒 PCI DSS v4.0 COMPLIANCE ANALYSIS")
     print("=" * 60)
-    
+
     # Analyze the captured data
     if isinstance(captured_data, list) and len(captured_data) > 0:
         first_capture = captured_data[0]
@@ -547,8 +641,9 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
             # Extract domain
             from urllib.parse import urlparse
             domain = urlparse(url).netloc
-            all_domains.add(domain)
-            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+            if domain:
+                all_domains.add(domain)
+                domain_counts[domain] = domain_counts.get(domain, 0) + 1
             
             # Get corresponding response
             response = responses.get(request_id, {})
@@ -559,8 +654,8 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
                     any(js_path in url for js_path in ['/js/', '/javascript/', '/scripts/']))
             
             is_css = (url.endswith('.css') or 
-                     'stylesheet' in url.lower() or 
-                     '/css/' in url)
+                        'stylesheet' in url.lower() or 
+                        '/css/' in url)
             
             # Check for file path in saved data
             filepath = None
@@ -580,8 +675,12 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
                 response_size = response.get('encodedDataLength', 0)
                 
                 if response_body:
-                    file_hash = hashlib.sha256(response_body.encode('utf-8')).hexdigest()
-                    file_size = len(response_body)
+                    try:
+                        file_hash = hashlib.sha256(response_body.encode('utf-8')).hexdigest()
+                        file_size = len(response_body)
+                    except Exception:
+                        file_hash = hashlib.sha256((url + str(response.get('status', 0))).encode('utf-8')).hexdigest()
+                        file_size = response_size
                 else:
                     # Use URL + status + size as a fallback identifier
                     fallback_data = f"{url}:{response.get('status', 0)}:{response_size}"
@@ -618,18 +717,15 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
 
         print(f"\n🌍 DISCOVERED DOMAINS:")
         print("-" * 40)
-        for domain in sorted(all_domains):
-            if domain:  # Skip empty domains
-                print(f"   🌐 {domain}")
+        for d in sorted(all_domains):
+            if d:  # Skip empty domains
+                print(f"   🌐 {d}")
         
         # Analyze file changes - Enhanced Detection
         print(f"\n📊 FILE CHANGE ANALYSIS:")
         print("-" * 40)
         
         # Get domain name to use when searching for baseline file hashes
-        # Use the computed primary_domain (most-common domain) rather than the
-        # loop-scoped `domain` variable which contains the last-request domain
-        # and can cause the baseline lookup to miss the true site baseline.
         domain_for_baseline = primary_domain or (os.path.basename(reports_directory) if reports_directory else (os.path.basename(output_directory) if output_directory else ''))
 
         # Load config and apply ignore patterns before analysis
@@ -1007,7 +1103,7 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
                 
         if file_changes['new_files']:
             new_fourth_party = [f for f in file_changes['new_files'] 
-                              if any(domain in f['domain'] for domain in ['jsdelivr.net', 'cdnjs.cloudflare.com', 'unpkg.com'])]
+                                if any(domain in f['domain'] for domain in ['jsdelivr.net', 'cdnjs.cloudflare.com', 'unpkg.com'])]
             if new_fourth_party:
                 compliance_score -= min(15, len(new_fourth_party) * 5)  # Max 15 point penalty
             
@@ -1126,13 +1222,54 @@ def analyze_captured_data(json_file_path, return_results=False, output_directory
             
             return analysis_results
 
+    # If not a list or empty captured_data, return results or None
+    if return_results:
+        return analysis_results
+    return None
+
+async def analyze_captured_data_async(json_file_path, return_results=False, output_directory=None, reports_directory=None, config_path=None):
+    """Async version of analyze_captured_data
+    
+    This function wraps the synchronous analyze_captured_data function using asyncio.to_thread
+    to make it compatible with async code.
+    """
+    return await asyncio.to_thread(
+        analyze_captured_data,
+        json_file_path,
+        return_results,
+        output_directory,
+        reports_directory,
+        config_path
+    )
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Analyze captured PCI compliance JSON')
     parser.add_argument('json_file', help='Path to captured JSON file')
     parser.add_argument('--config', '-c', dest='config', help='Path to config.yaml', default=None)
     parser.add_argument('--output-dir', dest='output_dir', help='Output directory for current scan (optional)', default=None)
     parser.add_argument('--reports-dir', dest='reports_dir', help='Reports directory to save file_hashes.json (optional)', default=None)
+    parser.add_argument('--use-async', action='store_true', help='Use async version of the analyzer')
 
     args = parser.parse_args()
 
-    analyze_captured_data(args.json_file, output_directory=args.output_dir, reports_directory=args.reports_dir, config_path=args.config)
+    if args.use_async:
+        # Run using asyncio
+        async def run_async():
+            return await analyze_captured_data_async(
+                args.json_file, 
+                return_results=False,
+                output_directory=args.output_dir, 
+                reports_directory=args.reports_dir, 
+                config_path=args.config
+            )
+        
+        asyncio.run(run_async())
+    else:
+        # Run synchronously
+        analyze_captured_data(
+            args.json_file, 
+            return_results=False,
+            output_directory=args.output_dir, 
+            reports_directory=args.reports_dir, 
+            config_path=args.config
+        )

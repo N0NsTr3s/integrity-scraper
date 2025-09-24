@@ -184,6 +184,12 @@ class EnhancedNetworkMonitor:
             # Enable Runtime domain for better error handling
             self.driver.execute_cdp_cmd('Runtime.enable', {}) # type: ignore
             
+            # Block image loading to improve performance
+            self.driver.execute_cdp_cmd('Network.setBlockedURLs', { # type: ignore
+                'urls': ['*.jpg', '*.jpeg', '*.png', '*.gif', '*.webp', 
+                         '*.svg', '*.bmp', '*.ico', '*.tiff', '*.avif']
+            })
+
             # Enable Page domain
             self.driver.execute_cdp_cmd('Page.enable', {}) # type: ignore
             
@@ -192,7 +198,7 @@ class EnhancedNetworkMonitor:
             
             # Set user agent override to avoid bot detection
             self.driver.execute_cdp_cmd('Network.setUserAgentOverride', { # type: ignore
-                'userAgent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                'userAgent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
             })
             
             print("✓ CDP domains enabled successfully")
@@ -536,7 +542,8 @@ class EnhancedNetworkMonitor:
     def collect_performance_resources(self):
         """Collect performance resources using Performance API"""
         try:
-            performance_entries = self.driver.execute_script(""" 
+            performance_entries = self.driver.execute_script(# pyright: ignore[reportOptionalMemberAccess]
+                """  
                 return performance.getEntriesByType('resource').map(entry => ({
                     name: entry.name,
                     entryType: entry.entryType,
@@ -1099,7 +1106,8 @@ class EnhancedNetworkMonitor:
     
     def get_results(self):
         """Get comprehensive monitoring results"""
-        return {
+        # Build full scan object first, then compact it to keep on-disk artifacts small.
+        scan_obj = {
             'capture_info': {
                 'timestamp': datetime.now().isoformat(),
                 'total_requests': len(self.requests),
@@ -1128,6 +1136,23 @@ class EnhancedNetworkMonitor:
             'captured_files': self.captured_files,
             'additional_elements': self.additional_elements
         }
+
+        try:
+            # Local import to avoid circular imports at module level
+            from tools.compact_scan import compact_scan_object
+            compact = compact_scan_object(scan_obj)
+            # If the compactor returns a coroutine, run it to completion to obtain the result.
+            if asyncio.iscoroutine(compact):
+                try:
+                    compact = asyncio.run(compact)
+                except RuntimeError:
+                    # An event loop is already running (e.g. called from async context) — fall back to un-compacted result.
+                    print("⚠️ compact_scan_object returned a coroutine and an event loop is already running; returning the un-compacted scan object")
+                    return scan_obj
+            return compact
+        except Exception:
+            # If compaction fails for any reason, return the full scan object as a fallback
+            return scan_obj
     
     def get_statistics(self):
         """Generate comprehensive statistics"""
